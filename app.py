@@ -1,3 +1,4 @@
+# app.py
 import os
 import json
 from flask import Flask, request, jsonify
@@ -5,27 +6,17 @@ from yt_dlp import YoutubeDL
 
 app = Flask(__name__)
 
-# Read API key from env (Render Dashboard → Environment → API_KEY)
-API_KEY = (os.getenv("API_KEY") or os.getenv("APIKEY") or os.getenv("SECRET_API_KEY") or "").strip()
+# Optional auth: if API_KEY exists, we require the matching header.
+API_KEY = os.getenv("API_KEY") or os.getenv("APIKEY") or os.getenv("SECRET_API_KEY")
 
-def _get_client_key(req: request) -> str | None:
-    """
-    Try multiple places/casings and trim whitespace.
-    Also allow ?key=... as a fallback for easier testing.
-    """
-    # Query param (for quick tests in tools)
-    qk = req.args.get("key")
-    if qk:
-        return qk.strip()
-
-    # Common header casings
-    for name in [
-        "x-api-key", "X-API-Key", "X-Api-Key", "x-apiKey", "X-APIKEY", "apikey", "Api-Key"
-    ]:
-        v = req.headers.get(name)
-        if v:
-            return v.strip()
-    return None
+def _client_key(req):
+    # Accept a few header casings
+    return (
+        req.headers.get("x-api-key")
+        or req.headers.get("X-API-Key")
+        or req.headers.get("X-Api-Key")
+        or req.headers.get("xApiKey")
+    )
 
 @app.get("/health")
 def health():
@@ -33,57 +24,67 @@ def health():
 
 @app.post("/resolve")
 def resolve():
-    # Require a key if one is configured
+    # Enforce key only if configured
     if API_KEY:
-        client_key = _get_client_key(request)
-        if not client_key:
-            return jsonify({"error": "unauthorized", "why": "missing key"}), 401
-        if client_key != API_KEY:
-            return jsonify({"error": "unauthorized", "why": "key mismatch"}), 401
+        client = _client_key(request)
+        if client != API_KEY:
+            return jsonify({"error": "unauthorized"}), 401
+
+    data = request.get_json(silent=True) or {}
+    url = (data.get("url") or "").strip()
+    if not url:
+        return jsonify({"error": "missing url"}), 400
+
+    # yt_dlp options chosen for reliability; no actual download, just info
+    ydl_opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+        "nocheckcertificate": True,
+        "extract_flat": False,
+    }
 
     try:
-        body = request.get_json(silent=True) or {}
-        url = (body.get("url") or "").strip()
-        if not url:
-            return jsonify({"error": "bad_request", "why": "missing url"}), 400
-
-        ydl_opts = {
-            "quiet": True,
-            "no_warnings": True,
-            "skip_download": True,
-            "extract_flat": False,
-            "noplaylist": True,
-            # Faster direct URL extraction
-            "forcejson": True,
-        }
-
         with YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
 
-        # Try to find a direct media URL
-        direct_url = None
+        # Try the canonical direct URL
+        direct_url = info.get("url")
 
-        # 1) formats list
-        for f in (info.get("formats") or []):
-            if f.get("url") and ("video" in (f.get("vcodec") or "") or f.get("acodec")):
-                direct_url = f["url"]
-                break
-
-        # 2) top-level url (some sites put it here)
-        if not direct_url and info.get("url"):
-            direct_url = info["url"]
+        # Fallback: pick a sane mp4 format if available
+        if not direct_url:
+            for f in (info.get("formats") or []):
+                # prefer mp4 progressive
+                if f.get("ext") == "mp4" and f.get("acodec") not in (None, "none") and f.get("vcodec") not in (None, "none"):
+                    direct_url = f.get("url")
+                    break
+            # ultimate fallback: *any* url
+            if not direct_url and info.get("formats"):
+                direct_url = info["formats"][-1].get("url")
 
         if not direct_url:
             return jsonify({"error": "no_direct_link"}), 422
 
-        return jsonify({
+        result = {
             "url": direct_url,
             "title": info.get("title"),
-            "thumbnail": info.get("thumbnail"),
             "duration": info.get("duration"),
-            "ext": info.get("ext"),
-            "http_headers": info.get("http_headers"),
-        }), 200
+            "ext": info.get("ext") or "mp4",
+            "thumb": info.get("thumbnail"),
+            # pass along a realistic UA—some CDNs check this
+            "http_headers": {
+                "Accept": "*/*",
+                "User-Agent": "Mozilla/5.0",
+            },
+        }
+        return jsonify(result), 200
 
     except Exception as e:
-        return jsonify({"error": "resolver_failed", "detail": str(e)}), 500
+        # Don’t leak stack traces; return a short error string for the app to show
+        return jsonify({"error": "resolve_failed", "detail": str(e)[:200]}), 500
+
+# NOTE: On Render we run via Gunicorn (see Procfile). This block is only for local dev.
+if __name__ == "__main__":
+    port = int(os.getenv("PORT", "8080"))
+    app.run(host="0.0.0.0", port=port, debug=False)
+
