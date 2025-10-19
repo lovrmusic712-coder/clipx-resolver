@@ -1,82 +1,77 @@
-import os, shlex, json, time
+# app.py
+import os
+import json
 from flask import Flask, request, jsonify
-from subprocess import Popen, PIPE
-
-API_KEY = os.environ.get("CLIPX_API_KEY", "dev-key")
-CACHE_TTL = int(os.environ.get("CLIPX_CACHE_TTL", "300"))
+from yt_dlp import YoutubeDL
 
 app = Flask(__name__)
-_cache = {}
 
-def run(cmd, timeout=20):
-    p = Popen(cmd, shell=True, stdout=PIPE, stderr=PIPE, text=True)
-    try:
-        out, err = p.communicate(timeout=timeout)
-    except Exception:
-        try: p.kill()
-        except: pass
-        raise RuntimeError("yt-dlp timeout")
-    if p.returncode != 0:
-        raise RuntimeError(err[:400] or "yt-dlp failed")
-    return out
+# Accept either API_KEY or APIKEY env var names
+API_KEY = os.getenv("API_KEY") or os.getenv("APIKEY") or os.getenv("SECRET_API_KEY")
 
-def pick_best_direct(info):
-    if isinstance(info, dict) and info.get("url"):
-        return info["url"]
-    formats = info.get("formats", []) if isinstance(info, dict) else []
-    if not formats:
-        return None
-    def has_av(f): return f.get("vcodec") != "none" and f.get("acodec") != "none"
-    def is_mp4(f): return f.get("ext") == "mp4"
-    def looks_nowm(f):
-        u = (f.get("url") or "").lower()
-        return ("nwm" in u) or ("watermark" not in u)
-    candidates = [f for f in formats if f.get("url")]
-    candidates.sort(key=lambda f: (
-        0 if looks_nowm(f) else 1,
-        0 if is_mp4(f) else 1,
-        0 if has_av(f) else 1,
-        -(f.get("tbr") or 0)
-    ))
-    return candidates[0].get("url") if candidates else None
+def _client_key(req):
+    # Accept a few header casings
+    return (
+        req.headers.get("x-api-key")
+        or req.headers.get("X-API-Key")
+        or req.headers.get("X-Api-Key")
+        or req.headers.get("x-apiKey")
+    )
+
+@app.get("/health")
+def health():
+    return "ok", 200
 
 @app.post("/resolve")
 def resolve():
-    if request.headers.get("x-api-key") != API_KEY:
-        return jsonify({"error": "unauthorized"}), 401
-    url = (request.json or {}).get("url", "").strip()
-    if not url:
-        return jsonify({"error": "missing url"}), 400
-    key = f"u:{url}"
-    now = time.time()
-    if key in _cache and now - _cache[key]["t"] < CACHE_TTL:
-        return jsonify(_cache[key]["data"])
-    cmd = f'yt-dlp -J --no-warnings --skip-download {shlex.quote(url)}'
-    try:
-        raw = run(cmd, timeout=25)
-        info = json.loads(raw)
-    except Exception as e:
-        return jsonify({"error": "resolver_failed", "details": str(e)[:200]}), 502
-    if info.get("_type") == "playlist" and info.get("entries"):
-        info = info["entries"][0]
-    direct = pick_best_direct(info)
-    if not direct:
-        return jsonify({"error": "no_playable_format"}), 404
-    payload = {
-        "url": direct,
-        "title": info.get("title"),
-        "thumbnail": info.get("thumbnail"),
-        "duration": info.get("duration"),
-        "webpage_url": info.get("webpage_url"),
-        "ext": info.get("ext"),
-        "http_headers": info.get("http_headers", {})
-    }
-    _cache[key] = {"t": now, "data": payload}
-    return jsonify(payload)
+    # If an API key is configured, require it
+    if API_KEY:
+        incoming = _client_key(request)
+        if not incoming or incoming != API_KEY:
+            return jsonify({"error": "unauthorized"}), 401
 
-@app.get("/healthz")
-def healthz():
-    return "ok", 200
+    try:
+        body = request.get_json(force=True, silent=True) or {}
+        url = body.get("url", "").strip()
+        if not url:
+            return jsonify({"error": "missing url"}), 400
+
+        ydl_opts = {
+            "quiet": True,
+            "skip_download": True,
+            "noplaylist": True,
+            "extract_flat": False,
+            "geo_bypass": True,
+            "nocheckcertificate": True,
+        }
+
+        with YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+
+        # Prefer a direct file URL if present
+        direct_url = None
+        if "url" in info:
+            direct_url = info["url"]
+        elif "formats" in info and info["formats"]:
+            # choose best video+audio
+            best = max(info["formats"], key=lambda f: f.get("height", 0) or 0)
+            direct_url = best.get("url")
+
+        if not direct_url:
+            return jsonify({"error": "no direct media link found"}), 422
+
+        return jsonify({
+            "url": direct_url,
+            "title": info.get("title"),
+            "thumbnail": info.get("thumbnail"),
+            "duration": info.get("duration"),
+            "webpage_url": info.get("webpage_url", url),
+        }), 200
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 if __name__ == "__main__":
+    # For local dev only
     app.run(host="0.0.0.0", port=8080)
+
